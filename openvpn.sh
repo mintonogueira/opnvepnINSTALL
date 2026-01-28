@@ -1,40 +1,38 @@
 #!/bin/sh
 
-# Caminhos Oficiais (Arch Linux)
+# Caminhos Oficiais
 OPENVPN_DIR="/etc/openvpn/server"
 PKI_DIR="$OPENVPN_DIR/pki"
 CLIENT_DIR="$HOME/ovpn-clients"
 PACMAN_CONF="/etc/pacman.conf"
 
-# Verificação de privilégios
-if [ "$(id -u)" -ne 0 ]; then
-    printf "Erro: Este script deve ser executado como root (sudo).\n"
-    exit 1
-fi
-
-# --- 1. INSTALAÇÃO E TRAVA (PACMAN.CONF) ---
-setup_deps() {
-    printf "\n>>> Instalando OpenVPN e OpenSSL...\n"
-    pacman -Sy --needed --noconfirm openvpn openssl curl
-
-    if ! grep -q "^IgnorePkg.*openvpn" "$PACMAN_CONF"; then
-        printf ">>> Travando atualizações do OpenVPN no pacman.conf...\n"
-        sed -i 's/^#IgnorePkg/IgnorePkg/' "$PACMAN_CONF"
-        sed -i "/^IgnorePkg/ s/$/ openvpn/" "$PACMAN_CONF"
+check_root() {
+    if [ "$(id -u)" -ne 0 ]; then
+        printf "Erro: Requer privilégios de root (sudo).\n"
+        exit 1
     fi
 }
 
-# --- 2. INFRAESTRUTURA SSL (CORREÇÃO DE PERMISSÕES) ---
+# --- 1. INSTALAÇÃO E LOCK ---
+install_deps() {
+    printf "\n>>> Instalando dependências e travando pacotes...\n"
+    pacman -Sy --needed --noconfirm openvpn openssl curl
+
+    if ! grep -q "^IgnorePkg.*openvpn" "$PACMAN_CONF"; then
+        sed -i 's/^#IgnorePkg/IgnorePkg/' "$PACMAN_CONF"
+        sed -i '/^IgnorePkg/ s/$/ openvpn/' "$PACMAN_CONF"
+    fi
+}
+
+# --- 2. PKI E PERMISSÕES (SOLUÇÃO DO ERRNO 13) ---
 setup_pki() {
-    printf "\n>>> Configurando PKI com permissões para o usuário 'nobody'...\n"
+    printf "\n>>> Configurando PKI com permissões para o grupo 'nobody'...\n"
     mkdir -p "$PKI_DIR"
-    
-    # O segredo: o grupo 'nobody' precisa entrar e ler a pasta
+    # O segredo: dono root, grupo 'nobody' com permissão de entrada (750)
     chown root:nobody "$PKI_DIR"
     chmod 750 "$PKI_DIR"
-
+    
     cd "$PKI_DIR" || exit
-
     openssl genrsa -out ca.key 4096
     openssl req -x509 -new -nodes -key ca.key -sha256 -days 3650 -out ca.crt -subj "/CN=ArchVPN-CA"
     openssl genrsa -out server.key 2048
@@ -42,23 +40,23 @@ setup_pki() {
     openssl x509 -req -in server.csr -CA ca.crt -CAkey ca.key -CAcreateserial -out server.crt -days 3650
     openssl dhparam -out dh.pem 2048
 
-    # Sintaxe OpenVPN 2.6+ (sem '--' antes de secret)
+    # Sintaxe atualizada para OpenVPN 2.6+
     openvpn --genkey secret ta.key
     
-    # Garante que os arquivos sejam legíveis pelo grupo nobody
+    # Permite leitura apenas para root e grupo nobody
     chmod 640 "$PKI_DIR"/*
 }
 
-# --- 3. CONFIGURAÇÃO DO SERVIDOR (CORREÇÃO DE HEREDOC) ---
-setup_config() {
+# --- 3. CONFIGURAÇÃO (EOF ALINHADO) ---
+configure_server() {
     printf "\n>>> Gerando server.conf...\n"
     printf "Porta UDP (1194): "
-    read -r port
-    port=${port:-1194}
+    read -r vpn_port
+    vpn_port=${vpn_port:-1194}
 
-# O delimitador 'EOF' abaixo DEVE estar na margem esquerda (coluna 0)
+# IMPORTANTE: O EOF deve estar colado na margem esquerda (coluna 0)
 cat <<EOF > "$OPENVPN_DIR/server.conf"
-port $port
+port $vpn_port
 proto udp
 dev tun
 ca $PKI_DIR/ca.crt
@@ -74,7 +72,7 @@ persist-key
 persist-tun
 user nobody
 group nobody
-status /run/openvpn-status.log
+status /tmp/openvpn-status.log
 verb 3
 explicit-exit-notify 1
 plugin /usr/lib/openvpn/plugins/openvpn-plugin-auth-pam.so login
@@ -85,41 +83,39 @@ EOF
     sysctl -p /etc/sysctl.d/99-openvpn.conf
 }
 
-# --- 4. FIREWALL (IPTABLES) ---
+# --- 4. FIREWALL ---
 setup_firewall() {
-    printf "\n>>> Configurando Firewall...\n"
+    printf "\n>>> Configurando NAT e Firewall...\n"
     ext_if=$(ip route | grep default | awk '{print $5}')
     iptables -t nat -A POSTROUTING -s 10.8.0.0/24 -o "$ext_if" -j MASQUERADE
-    iptables -I INPUT -p udp --dport "${port:-1194}" -j ACCEPT
+    iptables -I INPUT -p udp --dport "${vpn_port:-1194}" -j ACCEPT
 }
 
-# --- 5. GESTÃO DE USUÁRIOS (SSL + SENHA) ---
-create_user() {
-    printf "\n>>> Nome do usuário: "
-    read -r user
-    [ -z "$user" ] && return
+# --- 5. USUÁRIO INTERATIVO ---
+manage_user() {
+    printf "\n>>> Nome do usuário VPN: "
+    read -r username
+    [ -z "$username" ] && return
 
-    # Criação do usuário para PAM
-    if ! id "$user" >/dev/null 2>&1; then
-        useradd -M -s /usr/bin/nologin "$user"
-        printf "Defina a senha para '$user':\n"
-        passwd "$user"
+    if ! id "$username" >/dev/null 2>&1; then
+        useradd -M -s /usr/bin/nologin "$username"
+        printf "Defina a SENHA para '$username' no sistema:\n"
+        passwd "$username"
     fi
 
-    # Certificados
     cd "$PKI_DIR" || exit
-    openssl genrsa -out "${user}.key" 2048
-    openssl req -new -key "${user}.key" -out "${user}.csr" -subj "/CN=${user}"
-    openssl x509 -req -in "${user}.csr" -CA ca.crt -CAkey ca.key -CAcreateserial -out "${user}.crt" -days 3650
+    openssl genrsa -out "${username}.key" 2048
+    openssl req -new -key "${username}.key" -out "${username}.csr" -subj "/CN=${username}"
+    openssl x509 -req -in "${username}.csr" -CA ca.crt -CAkey ca.key -CAcreateserial -out "${username}.crt" -days 3650
 
     mkdir -p "$CLIENT_DIR"
-    ip=$(curl -s https://ifconfig.me)
+    remote_ip=$(curl -s https://ifconfig.me)
 
-cat <<EOF > "$CLIENT_DIR/${user}.ovpn"
+cat <<EOF > "$CLIENT_DIR/${username}.ovpn"
 client
 dev tun
 proto udp
-remote $ip ${port:-1194}
+remote $remote_ip ${vpn_port:-1194}
 resolv-retry infinite
 nobind
 remote-cert-tls server
@@ -130,35 +126,37 @@ key-direction 1
 $(cat ca.crt)
 </ca>
 <cert>
-$(cat "${user}.crt")
+$(cat "${username}.crt")
 </cert>
 <key>
-$(cat "${user}.key")
+$(cat "${username}.key")
 </key>
 <tls-auth>
 $(cat ta.key)
 </tls-auth>
 EOF
-    printf "\n[OK] Arquivo gerado: $CLIENT_DIR/${user}.ovpn\n"
+    printf "\n[SUCESSO] Arquivo gerado em: $CLIENT_DIR/${username}.ovpn\n"
 }
 
 # --- MENU ---
+check_root
 while true; do
     printf "\n1) Instalação Completa\n2) Criar Usuário + SSL\n3) Reverter\n4) Sair\nOpção: "
     read -r opt
     case $opt in
-        1) setup_deps; setup_pki; setup_config; setup_firewall
+        1) install_deps; setup_pki; configure_server; setup_firewall
            systemctl daemon-reload
            systemctl enable --now openvpn-server@server
            sleep 2
            if ! systemctl is-active --quiet openvpn-server@server; then
-               printf "\n[ERRO] Falha ao iniciar. Logs:\n"
+               printf "\n[ERRO] O serviço falhou. Verifique o log:\n"
                journalctl -u openvpn-server@server --no-pager -n 20
            else
-               printf "\n[SUCESSO] Servidor OpenVPN Ativo!\n"
+               printf "\n[SUCESSO] Servidor OpenVPN em execução!\n"
            fi ;;
-        2) create_user ;;
+        2) manage_user ;;
         3) systemctl stop openvpn-server@server; rm -rf "$PKI_DIR"; sed -i '/^IgnorePkg/ s/ openvpn//' "$PACMAN_CONF"; printf "Limpeza concluída.\n" ;;
         4) exit 0 ;;
+        *) printf "Opção inválida.\n" ;;
     esac
 done
