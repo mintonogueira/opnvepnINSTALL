@@ -1,6 +1,6 @@
 #!/bin/sh
 
-# Configurações de Caminhos Oficiais (Arch Wiki)
+# Configurações de Caminhos
 OPENVPN_DIR="/etc/openvpn/server"
 PKI_DIR="$OPENVPN_DIR/pki"
 CLIENT_DIR="$HOME/ovpn-clients"
@@ -8,17 +8,16 @@ PACMAN_CONF="/etc/pacman.conf"
 
 # Verificação de root
 if [ "$(id -u)" -ne 0 ]; then
-    printf "Erro: Requer privilégios de root (sudo).\n"
+    printf "Erro: Requer root (sudo).\n"
     exit 1
 fi
 
-# --- 1. INSTALAÇÃO E TRAVA NO PACMAN ---
+# --- 1. INSTALAÇÃO E TRAVA ---
 setup_dependencies() {
     printf "\n>>> Instalando OpenVPN e OpenSSL...\n"
     pacman -Sy --needed --noconfirm openvpn openssl curl
 
     if ! grep -q "^IgnorePkg.*openvpn" "$PACMAN_CONF"; then
-        printf ">>> Aplicando IgnorePkg para o OpenVPN no pacman.conf...\n"
         sed -i 's/^#IgnorePkg/IgnorePkg/' "$PACMAN_CONF"
         sed -i "/^IgnorePkg/ s/$/ openvpn/" "$PACMAN_CONF"
     fi
@@ -26,7 +25,7 @@ setup_dependencies() {
 
 # --- 2. PKI E PERMISSÕES (SOLUÇÃO DO ERRNO 13) ---
 setup_pki() {
-    printf "\n>>> Configurando PKI e Permissões de Sistema...\n"
+    printf "\n>>> Configurando PKI e Permissões de Acesso...\n"
     mkdir -p "$PKI_DIR"
     
     # AJUSTE CRUCIAL: O grupo 'nobody' precisa entrar na pasta e ler os arquivos
@@ -41,21 +40,21 @@ setup_pki() {
     openssl x509 -req -in server.csr -CA ca.crt -CAkey ca.key -CAcreateserial -out server.crt -days 3650
     openssl dhparam -out dh.pem 2048
 
-    # CORREÇÃO: Sintaxe OpenVPN 2.6+ (sem os traços iniciais em secret)
+    # SINTAXE CORRIGIDA: Sem '--' antes de secret
     openvpn --genkey secret ta.key
     
-    # Permite leitura apenas para root e grupo nobody
+    # Permite leitura para root e grupo nobody
     chmod 640 "$PKI_DIR"/*
 }
 
 # --- 3. CONFIGURAÇÃO (CORREÇÃO DE HEREDOC/EOF) ---
 configure_server() {
     printf "\n>>> Gerando server.conf...\n"
-    printf "Porta UDP (Padrão 1194): "
+    printf "Porta UDP (1194): "
     read -r port
     port=${port:-1194}
 
-# Nota: O delimitador EOF abaixo DEVE estar na margem esquerda (coluna 0)
+# ATENÇÃO: Os 'EOF' abaixo DEVEM estar na coluna 0 (sem espaços)
 cat <<EOF > "$OPENVPN_DIR/server.conf"
 port $port
 proto udp
@@ -73,7 +72,7 @@ persist-key
 persist-tun
 user nobody
 group nobody
-status /run/openvpn-status.log
+status /tmp/openvpn-status.log
 verb 3
 explicit-exit-notify 1
 plugin /usr/lib/openvpn/plugins/openvpn-plugin-auth-pam.so login
@@ -84,7 +83,7 @@ EOF
     sysctl -p /etc/sysctl.d/99-openvpn.conf
 }
 
-# --- 4. FIREWALL (IPTABLES) ---
+# --- 4. FIREWALL ---
 setup_firewall() {
     printf "\n>>> Configurando NAT e Firewall...\n"
     ext_if=$(ip route | grep default | awk '{print $5}')
@@ -92,7 +91,7 @@ setup_firewall() {
     iptables -I INPUT -p udp --dport "${port:-1194}" -j ACCEPT
 }
 
-# --- 5. GESTÃO DE USUÁRIO (SSL + PAM) ---
+# --- 5. GESTÃO DE USUÁRIO ---
 manage_user() {
     printf "\n>>> Nome do usuário VPN: "
     read -r user
@@ -100,7 +99,6 @@ manage_user() {
 
     if ! id "$user" >/dev/null 2>&1; then
         useradd -M -s /usr/bin/nologin "$user"
-        printf "Defina a senha para '$user' (PAM auth):\n"
         passwd "$user"
     fi
 
@@ -149,7 +147,7 @@ while true; do
            systemctl enable --now openvpn-server@server
            sleep 2
            if ! systemctl is-active --quiet openvpn-server@server; then
-               printf "\n[ERRO] Falha crítica. Exibindo log real:\n"
+               printf "\n[ERRO] O serviço falhou. Logs reais abaixo:\n"
                journalctl -u openvpn-server@server --no-pager -n 20
            else
                printf "\n[SUCESSO] Servidor OpenVPN em execução!\n"
