@@ -1,42 +1,41 @@
 #!/bin/sh
 
-# Configurações de Caminhos (Padrões Arch Linux)
+# Caminhos Oficiais (Arch Wiki)
 OPENVPN_DIR="/etc/openvpn/server"
 PKI_DIR="$OPENVPN_DIR/pki"
-CLIENT_CONFIG_DIR="$HOME/ovpn-clients"
+CLIENT_DIR="$HOME/ovpn-clients"
 PACMAN_CONF="/etc/pacman.conf"
 
-check_root() {
-    if [ "$(id -u)" -ne 0 ]; then
-        printf "Erro: Requer privilégios de root (sudo).\n"
-        exit 1
-    fi
-}
+# Verificação de privilégios
+if [ "$(id -u)" -ne 0 ]; then
+    printf "Erro: Este script deve ser executado como root (sudo).\n"
+    exit 1
+fi
 
-# --- 1. INSTALAÇÃO E LOCK DE VERSÃO ---
-install_dependencies() {
+# --- 1. DEPENDÊNCIAS E TRAVA (PACMAN.CONF) ---
+setup_dependencies() {
     printf "\n>>> Instalando OpenVPN e OpenSSL...\n"
     pacman -Sy --needed --noconfirm openvpn openssl curl
 
     if ! grep -q "^IgnorePkg.*openvpn" "$PACMAN_CONF"; then
-        printf ">>> Aplicando trava de atualização no pacman.conf...\n"
+        printf ">>> Aplicando trava de atualização (IgnorePkg) no pacman.conf...\n"
         sed -i 's/^#IgnorePkg/IgnorePkg/' "$PACMAN_CONF"
         sed -i '/^IgnorePkg/ s/$/ openvpn/' "$PACMAN_CONF"
     fi
 }
 
-# --- 2. INFRAESTRUTURA SSL (SOLUÇÃO DO ERRNO 13) ---
+# --- 2. INFRAESTRUTURA SSL (CONFORME OPENSSL/OVPN COMMUNITY) ---
 setup_pki() {
-    printf "\n>>> Configurando PKI com padrões de segurança do Arch...\n"
-    mkdir -p "$PKI_DIR"
+    printf "\n>>> Configurando PKI e Permissões de Sistema...\n"
     
-    # O segredo: o grupo 'nobody' precisa de permissão 750 para acessar a pasta
+    # Criar pasta e ajustar permissões para que o grupo 'nobody' possa entrar (750)
+    mkdir -p "$PKI_DIR"
     chown root:nobody "$PKI_DIR"
     chmod 750 "$PKI_DIR"
-    
+
     cd "$PKI_DIR" || exit
 
-    # Geração dos certificados via OpenSSL
+    # Gerar CA, Certificado e Chave do Servidor
     openssl genrsa -out ca.key 4096
     openssl req -x509 -new -nodes -key ca.key -sha256 -days 3650 -out ca.crt -subj "/CN=ArchVPN-CA"
     openssl genrsa -out server.key 2048
@@ -44,21 +43,21 @@ setup_pki() {
     openssl x509 -req -in server.csr -CA ca.crt -CAkey ca.key -CAcreateserial -out server.crt -days 3650
     openssl dhparam -out dh.pem 2048
 
-    # Sintaxe OpenVPN 2.6+ (sem os traços iniciais em secret)
+    # Gerar chave TLS-Auth (Sintaxe OpenVPN 2.6+)
     openvpn --genkey secret ta.key
     
-    # Garante que o grupo 'nobody' leia os arquivos (chmod 640)
+    # Ajustar arquivos para leitura pelo grupo 'nobody' (640)
     chmod 640 "$PKI_DIR"/*
 }
 
-# --- 3. CONFIGURAÇÃO DO SERVIDOR (CORREÇÃO DE HEREDOC) ---
+# --- 3. CONFIGURAÇÃO DO SERVIDOR (CONFORME ARCH WIKI) ---
 configure_server() {
-    printf "\n>>> Gerando server.conf...\n"
-    printf "Porta UDP (Padrão 1194): "
+    printf "\n>>> Gerando server.conf (PAM + SSL)...\n"
+    printf "Informe a porta UDP desejada (Padrão 1194): "
     read -r vpn_port
     vpn_port=${vpn_port:-1194}
 
-    # O EOF deve estar obrigatoriamente na coluna 0 (sem espaços antes)
+# Nota: O EOF deve estar obrigatoriamente na margem esquerda (coluna 0)
 cat <<EOF > "$OPENVPN_DIR/server.conf"
 port $vpn_port
 proto udp
@@ -79,32 +78,33 @@ group nobody
 status /run/openvpn-status.log
 verb 3
 explicit-exit-notify 1
+# Plugin PAM para autenticação de usuário do Arch Linux
 plugin /usr/lib/openvpn/plugins/openvpn-plugin-auth-pam.so login
 EOF
 
-    # Habilitar Forwarding conforme Arch Wiki
-    echo 1 > /proc/sys/net/ipv4/ip_forward
+    # Ativar IP Forwarding
     printf "net.ipv4.ip_forward=1\n" > /etc/sysctl.d/99-openvpn.conf
     sysctl -p /etc/sysctl.d/99-openvpn.conf
 }
 
-# --- 4. FIREWALL (IPTABLES) ---
+# --- 4. FIREWALL (IPTABLES - ARCH WIKI) ---
 setup_firewall() {
-    printf "\n>>> Configurando regras de NAT e Firewall...\n"
+    printf "\n>>> Configurando Firewall e NAT...\n"
     ext_if=$(ip route | grep default | awk '{print $5}')
     iptables -t nat -A POSTROUTING -s 10.8.0.0/24 -o "$ext_if" -j MASQUERADE
     iptables -I INPUT -p udp --dport "${vpn_port:-1194}" -j ACCEPT
 }
 
-# --- 5. GESTÃO DE USUÁRIO (SSL + PAM) ---
+# --- 5. GESTÃO DE USUÁRIO (SSL + SISTEMA) ---
 manage_user() {
-    printf "\n>>> Nome do usuário VPN: "
+    printf "\n>>> Nome do usuário para a VPN: "
     read -r username
     [ -z "$username" ] && return
 
+    # Criar usuário sem shell para autenticação PAM
     if ! id "$username" >/dev/null 2>&1; then
         useradd -M -s /usr/bin/nologin "$username"
-        printf "Defina a SENHA para '$username' (usada no login PAM):\n"
+        printf "Defina a senha para o login VPN de '$username':\n"
         passwd "$username"
     fi
 
@@ -113,10 +113,10 @@ manage_user() {
     openssl req -new -key "${username}.key" -out "${username}.csr" -subj "/CN=${username}"
     openssl x509 -req -in "${username}.csr" -CA ca.crt -CAkey ca.key -CAcreateserial -out "${username}.crt" -days 3650
 
-    mkdir -p "$CLIENT_CONFIG_DIR"
+    mkdir -p "$CLIENT_DIR"
     remote_ip=$(curl -s https://ifconfig.me)
 
-cat <<EOF > "$CLIENT_CONFIG_DIR/${username}.ovpn"
+cat <<EOF > "$CLIENT_DIR/${username}.ovpn"
 client
 dev tun
 proto udp
@@ -127,6 +127,7 @@ remote-cert-tls server
 cipher AES-256-GCM
 auth-user-pass
 key-direction 1
+verb 3
 <ca>
 $(cat ca.crt)
 </ca>
@@ -140,40 +141,42 @@ $(cat "${username}.key")
 $(cat ta.key)
 </tls-auth>
 EOF
-    printf "\n[OK] Arquivo gerado: $CLIENT_CONFIG_DIR/${username}.ovpn\n"
+    printf "\n[PRONTO] Arquivo gerado: $CLIENT_DIR/${username}.ovpn\n"
 }
 
-# --- 6. REVERSÃO ---
-revert_all() {
-    printf "\nConfirmar limpeza total das configurações? (s/n): "
-    read -r confirm
-    if [ "$confirm" = "s" ]; then
-        systemctl stop openvpn-server@server
-        rm -rf "$PKI_DIR"
-        rm -f "$OPENVPN_DIR/server.conf"
-        sed -i '/^IgnorePkg/ s/ openvpn//' "$PACMAN_CONF"
-        printf "Configurações removidas e pacman destravado.\n"
-    fi
-}
-
-# --- MENU ---
-check_root
+# --- MENU PRINCIPAL ---
 while true; do
-    printf "\n1) Instalação Completa\n2) Criar Usuário + SSL\n3) Reverter\n4) Sair\nOpção: "
+    printf "\n==========================================\n"
+    printf "   OPENVPN MANAGER (ARCH/COMMUNITY)\n"
+    printf "==========================================\n"
+    printf "1) Instalação Completa (Servidor + Firewall)\n"
+    printf "2) Criar Usuário VPN (SSL + Senha)\n"
+    printf "3) Reverter Tudo (Limpar Chaves e Conf)\n"
+    printf "4) Sair\n"
+    printf "Escolha uma opção: "
     read -r opt
+
     case $opt in
-        1) install_dependencies; setup_pki; configure_server; setup_firewall
-           systemctl daemon-reload
-           systemctl enable --now openvpn-server@server
-           sleep 2
-           if ! systemctl is-active --quiet openvpn-server@server; then
-               printf "\n[ERRO] Serviço falhou. Logs:\n"
-               journalctl -u openvpn-server@server --no-pager -n 20
-           else
-               printf "\n[SUCESSO] Servidor OpenVPN Ativo!\n"
-           fi ;;
+        1) 
+            setup_dependencies; setup_pki; configure_server; setup_firewall
+            systemctl daemon-reload
+            systemctl enable --now openvpn-server@server
+            sleep 2
+            if ! systemctl is-active --quiet openvpn-server@server; then
+                printf "\n[ERRO] Serviço falhou. Verificando logs:\n"
+                journalctl -u openvpn-server@server --no-pager -n 20
+            else
+                printf "\n[SUCESSO] Servidor OpenVPN ativo!\n"
+            fi
+            ;;
         2) manage_user ;;
-        3) revert_all ;;
+        3) 
+            systemctl stop openvpn-server@server
+            rm -rf "$PKI_DIR"
+            rm -f "$OPENVPN_DIR/server.conf"
+            sed -i '/^IgnorePkg/ s/ openvpn//' "$PACMAN_CONF"
+            printf "Reversão concluída.\n"
+            ;;
         4) exit 0 ;;
     esac
 done
